@@ -10,9 +10,9 @@
   the specific peer.
 - Assumption: a tab is one short-lived session. Closing it removes its presence;
   the stale timeout is the fallback when the browser cannot send a leave request.
-- A two-browser WebRTC test still needs a reachable PostgreSQL database and two
-  browser sessions. This checkout's `DATABASE_URL` is still the sample
-  `.env.example` value, so `prisma db push` cannot connect here.
+- Two-session API smoke tests passed join, discovery, authentication, privacy
+  offset, request/accept, signaling, end, and busy-state cleanup. A manual
+  two-browser WebRTC/camera test remains.
 
 ## Phase 2 — Make it good
 
@@ -53,9 +53,9 @@
 ## Delivery checks
 
 - `npm install`, `npm run lint`, and `npm run build` completed.
-- The entry screen was smoke-checked through the local development server.
-- `npx prisma db push` was attempted but could not connect because the local
-  `DATABASE_URL` is still the placeholder. A valid PostgreSQL URL is required
-  before end-to-end testing or deployment.
+- The entry screen and Mapbox map loaded through the local development server.
+- `npx prisma db push` completed against a local Prisma Postgres dev server.
+  The ignored `.env` points to this local instance; use a hosted PostgreSQL URL
+  and configure the deployment's environment variables before publishing.
 - A Mapbox token is present locally; `.env` is intentionally not included in
-  version control.
+  version control. No Vercel deployment was created.
