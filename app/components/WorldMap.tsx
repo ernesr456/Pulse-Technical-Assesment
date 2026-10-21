@@ -5,7 +5,7 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import type { Map as MapboxMap, Marker } from "mapbox-gl";
 import type { PeerDot } from "@/lib/types";
 
-const TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? "pk.eyJ1IjoicHVsc2UtbWFwIiwiYSI6ImNrMDBkZW1vMDAwMDAwMDAifQ.AAAAAAAAAAAAAAAAAAAAAA";
+const TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? "";
 
 function dotColor(id: string): string {
   let hash = 0;
@@ -29,6 +29,7 @@ export default function WorldMap({
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapboxMap | null>(null);
   const markersRef = useRef<Map<string, Marker>>(new Map());
+  const peersRef = useRef(peers);
   const meMarkerRef = useRef<Marker | null>(null);
   const [ready, setReady] = useState(false);
 
@@ -39,6 +40,7 @@ export default function WorldMap({
   useEffect(() => {
     onPeerClickRef.current = onPeerClick;
     canConnectRef.current = canConnect;
+    peersRef.current = peers;
   });
 
   // Initialise the map once.
@@ -129,7 +131,14 @@ export default function WorldMap({
           el.title = "Tap to connect";
           el.addEventListener("click", (e) => {
             e.stopPropagation();
-            if (canConnectRef.current) onPeerClickRef.current(peer.id);
+            const currentPeer = peersRef.current.find((item) => item.id === peer.id);
+            if (
+              canConnectRef.current &&
+              currentPeer &&
+              !currentPeer.busy
+            ) {
+              onPeerClickRef.current(peer.id);
+            }
           });
           marker = new mapboxgl.Marker({ element: el })
             .setLngLat([peer.lng, peer.lat])
@@ -137,6 +146,9 @@ export default function WorldMap({
           markers.set(peer.id, marker);
         }
         marker.getElement().style.opacity = peer.busy ? "0.35" : "1";
+        marker.getElement().title = peer.busy
+          ? "Already in a conversation"
+          : "Tap to connect";
       }
 
       // Drop markers for peers that went offline / got filtered out.
@@ -159,17 +171,17 @@ export default function WorldMap({
 
       {!TOKEN && (
         <div className="absolute inset-0 flex items-center justify-center p-6 text-center">
-          <p className="max-w-md rounded-lg bg-zinc-800 p-4 text-sm text-zinc-200">
+          <p className="max-w-md rounded-2xl border border-white/10 bg-slate-950/85 p-5 text-sm text-slate-200 shadow-2xl backdrop-blur">
             Set{" "}
-            <code className="text-emerald-400">NEXT_PUBLIC_MAPBOX_TOKEN</code> in{" "}
+            <code className="text-cyan-200">NEXT_PUBLIC_MAPBOX_TOKEN</code> in{" "}
             <code>.env</code> to load the map.
           </p>
         </div>
       )}
 
-      {/* Online count */}
-      <div className="absolute bottom-4 left-4 rounded-full bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-300 backdrop-blur">
-        {peers.length} online
+      <div className="absolute bottom-5 left-5 rounded-2xl border border-white/10 bg-slate-950/75 px-4 py-3 text-xs text-slate-300 shadow-xl backdrop-blur-xl">
+        <span className="mr-2 inline-block h-2 w-2 animate-pulse rounded-full bg-cyan-200" />
+        {peers.filter((peer) => !peer.busy).length} {peers.filter((peer) => !peer.busy).length === 1 ? "person" : "people"} nearby
       </div>
     </div>
   );
