@@ -61,15 +61,44 @@ export default function ChatPanel({
           <button
             onClick={onStartVideo}
             disabled={!connected || videoBusy}
-            className="rounded-full border border-white/12 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-cyan-200/50 hover:text-cyan-100 disabled:opacity-40"
+            aria-label="Start video call"
+            title="Start video call"
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-white/12 text-slate-200 transition hover:border-cyan-200/50 hover:text-cyan-100 disabled:opacity-40"
           >
-            Video call
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4"
+            >
+              <rect x="3" y="6" width="13" height="12" rx="2" />
+              <path d="m16 10 5-3v10l-5-3" />
+            </svg>
           </button>
           <button
             onClick={onEnd}
-            className="rounded-full bg-rose-400/12 px-3 py-2 text-xs font-medium text-rose-200 transition hover:bg-rose-400/20"
+            aria-label="Leave conversation"
+            title="Leave conversation"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-rose-400/12 text-rose-200 transition hover:bg-rose-400/20"
           >
-            Leave
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4"
+            >
+              <path d="M10 17l5-5-5-5" />
+              <path d="M15 12H3" />
+              <path d="M12 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-6" />
+            </svg>
           </button>
         </div>
       </header>
