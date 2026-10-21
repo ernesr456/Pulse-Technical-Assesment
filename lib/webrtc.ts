@@ -76,10 +76,14 @@ export class PeerSession {
     dc.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data as string);
-        if (msg.t === "chat" && typeof msg.text === "string") {
+        if (
+          msg.t === "chat" &&
+          typeof msg.text === "string" &&
+          msg.text.length <= 500
+        ) {
           this.cb.onChat(msg.text);
-        } else if (msg.t === "ctrl" && typeof msg.ctrl === "string") {
-          this.cb.onControl(msg.ctrl as PeerControl);
+        } else if (msg.t === "ctrl" && isPeerControl(msg.ctrl)) {
+          this.cb.onControl(msg.ctrl);
         }
       } catch {}
     };
@@ -90,6 +94,7 @@ export class PeerSession {
     const data = JSON.parse(payload);
 
     if (type === "ice") {
+      if (this.ignoreOffer) return;
       if (!this.pc.remoteDescription) {
         this.pendingCandidates.push(data);
         return;
@@ -107,8 +112,8 @@ export class PeerSession {
     this.ignoreOffer = !this.polite && offerCollision;
     if (this.ignoreOffer) return;
 
-    await this.flushPendingCandidates();
     await this.pc.setRemoteDescription(desc);
+    await this.flushPendingCandidates();
     if (desc.type === "offer") {
       await this.pc.setLocalDescription();
       if (this.pc.localDescription) {
@@ -129,7 +134,7 @@ export class PeerSession {
   }
 
   sendChat(text: string) {
-    this.safeSend({ t: "msg", text });
+    this.safeSend({ t: "chat", text });
   }
 
   sendControl(ctrl: PeerControl) {
@@ -152,6 +157,7 @@ export class PeerSession {
         this.pc.addTrack(track, this.localStream);
       }
     }
+
     return this.localStream;
   }
 
@@ -165,6 +171,7 @@ export class PeerSession {
           } catch {}
         }
       }
+
       this.localStream = null;
     }
   }
@@ -182,4 +189,13 @@ export class PeerSession {
       this.pc.close();
     } catch {}
   }
+}
+
+function isPeerControl(value: unknown): value is PeerControl {
+  return (
+    value === "video-request" ||
+    value === "video-accept" ||
+    value === "video-decline" ||
+    value === "video-end"
+  );
 }

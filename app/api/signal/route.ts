@@ -1,6 +1,9 @@
 import type { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import type { SignalType } from "@/lib/types";
+import { isAuthorizedSession, isValidSessionId } from "@/lib/session-auth";
+import { STALE_MS } from "@/lib/presence";
+import { readJsonBody } from "@/lib/request";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,19 +24,25 @@ const MAX_PAYLOAD = 64 * 1024; // SDP/ICE are small; cap to be safe.
 // Drops one message into the recipient's mailbox. Also manages the `busy`
 // flag so a user can only be in one connection at a time.
 export async function POST(request: NextRequest) {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: "invalid body" }, { status: 400 });
+  const parsed = await readJsonBody(request, MAX_PAYLOAD + 4096);
+  if (!parsed.ok) {
+    return Response.json(
+      { error: parsed.status === 413 ? "body too large" : "invalid body" },
+      { status: parsed.status },
+    );
   }
+  const body = parsed.value;
 
   const { fromId, toId, type, payload } = (body ?? {}) as Record<
     string,
     unknown
   >;
 
-  if (typeof fromId !== "string" || typeof toId !== "string") {
+  if (
+    !isValidSessionId(fromId) ||
+    !isValidSessionId(toId) ||
+    fromId === toId
+  ) {
     return Response.json({ error: "invalid ids" }, { status: 400 });
   }
   if (typeof type !== "string" || !VALID_TYPES.includes(type as SignalType)) {
@@ -49,43 +58,149 @@ export async function POST(request: NextRequest) {
 
   const signalType = type as SignalType;
   const payloadStr = typeof payload === "string" ? payload : null;
+  if (["offer", "answer", "ice"].includes(signalType)) {
+    if (!payloadStr) {
+      return Response.json({ error: "payload required" }, { status: 400 });
+    }
+    try {
+      JSON.parse(payloadStr);
+    } catch {
+      return Response.json({ error: "invalid payload" }, { status: 400 });
+    }
+  }
+
+  if (!(await isAuthorizedSession(request, fromId))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+
+  const onlineCutoff = new Date(Date.now() - STALE_MS);
+  const [source, target] = await Promise.all([
+    prisma.presence.findUnique({
+      where: { id: fromId },
+      select: { busy: true, connectedTo: true, lastSeen: true },
+    }),
+    prisma.presence.findUnique({
+      where: { id: toId },
+      select: { busy: true, connectedTo: true, lastSeen: true },
+    }),
+  ]);
+  if (!source || source.lastSeen < onlineCutoff) {
+    return Response.json({ error: "sender offline" }, { status: 404 });
+  }
+  if (!target || target.lastSeen < onlineCutoff) {
+    return Response.json({ error: "recipient offline" }, { status: 404 });
+  }
 
   // Enforce "one active connection at a time": if the target is already busy,
   // auto-decline the request instead of delivering it.
   if (signalType === "request") {
-    const target = await prisma.presence.findUnique({
-      where: { id: toId },
-      select: { busy: true },
-    });
-    if (!target) {
-      // Target went offline — tell the initiator it was declined.
-      await sendDecline(toId, fromId);
-      return Response.json({ ok: true, autoDeclined: true });
+    if (source.busy) {
+      return Response.json({ error: "sender already connected" }, { status: 409 });
     }
     if (target.busy) {
       await sendDecline(toId, fromId);
       return Response.json({ ok: true, autoDeclined: true });
     }
+    const existingRequest = await prisma.signal.findFirst({
+      where: { fromId, toId, type: "request" },
+      select: { id: true },
+    });
+    if (existingRequest) {
+      return Response.json({ error: "request already pending" }, { status: 409 });
+    }
   }
 
-  // Busy transitions:
-  // - accept: the connection is now active → mark BOTH peers busy.
-  // - decline/end: free both peers.
+  if (signalType === "accept" || signalType === "decline") {
+    const pendingRequest = await prisma.signal.findFirst({
+      where: {
+        fromId: toId,
+        toId: fromId,
+        type: "request",
+      },
+      select: { id: true },
+    });
+    if (!pendingRequest) {
+      return Response.json({ error: "no pending request" }, { status: 409 });
+    }
+  }
+
+  // Accept only if both sessions are still free and roll back the first flag
+  // if the other user accepted a different request at the same time.
   if (signalType === "accept") {
-    await prisma.presence.updateMany({
-      where: { id: { in: [fromId, toId] } },
-      data: { busy: true },
+    const initiatorReserved = await prisma.presence.updateMany({
+      where: { id: fromId, busy: false, lastSeen: { gte: onlineCutoff } },
+      data: { busy: true, connectedTo: toId },
     });
+    const recipientReserved = initiatorReserved.count === 1
+      ? await prisma.presence.updateMany({
+          where: { id: toId, busy: false, lastSeen: { gte: onlineCutoff } },
+          data: { busy: true, connectedTo: fromId },
+        })
+      : { count: 0 };
+    if (initiatorReserved.count !== 1 || recipientReserved.count !== 1) {
+      if (initiatorReserved.count === 1) {
+        await prisma.presence.updateMany({
+          where: { id: fromId, connectedTo: toId },
+          data: { busy: false, connectedTo: null },
+        });
+      }
+      await sendDecline(fromId, toId);
+      return Response.json({ ok: true, autoDeclined: true });
+    }
   } else if (signalType === "decline") {
-    await prisma.presence.updateMany({
-      where: { id: { in: [fromId, toId] } },
-      data: { busy: false },
+    await prisma.signal.deleteMany({
+      where: { fromId: toId, toId: fromId, type: "request" },
     });
   }
 
-  await prisma.signal.create({
-    data: { fromId, toId, type: signalType, payload: payloadStr },
-  });
+  if (signalType === "offer" || signalType === "answer" || signalType === "ice") {
+    if (
+      !source.busy ||
+      !target.busy ||
+      source.connectedTo !== toId ||
+      target.connectedTo !== fromId
+    ) {
+      return Response.json({ error: "no active connection" }, { status: 409 });
+    }
+  }
+
+  if (signalType === "end" && source.busy) {
+    if (source.connectedTo !== toId || target.connectedTo !== fromId) {
+      return Response.json({ error: "not connected to recipient" }, { status: 409 });
+    }
+    await prisma.presence.updateMany({
+      where: { id: { in: [fromId, toId] }, connectedTo: { not: null } },
+      data: { busy: false, connectedTo: null },
+    });
+  } else if (signalType === "end" && target.busy) {
+    return Response.json({ error: "not connected to recipient" }, { status: 409 });
+  } else if (signalType === "end") {
+    await prisma.signal.deleteMany({
+      where: { fromId, toId, type: "request" },
+    });
+  }
+
+  try {
+    await prisma.signal.create({
+      data: { fromId, toId, type: signalType, payload: payloadStr },
+    });
+  } catch (error) {
+    if (signalType === "accept") {
+      await prisma.presence.updateMany({
+        where: {
+          id: { in: [fromId, toId] },
+          connectedTo: { in: [fromId, toId] },
+        },
+        data: { busy: false, connectedTo: null },
+      });
+    }
+    throw error;
+  }
+  if (signalType === "accept") {
+    await prisma.signal.deleteMany({
+      where: { fromId: toId, toId: fromId, type: "request" },
+    });
+  }
 
   return Response.json({ ok: true });
 }

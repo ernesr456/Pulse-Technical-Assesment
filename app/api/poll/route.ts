@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { STALE_MS, SIGNAL_TTL_MS } from "@/lib/presence";
 import type { PollResponse } from "@/lib/types";
+import { isAuthorizedSession, isValidSessionId } from "@/lib/session-auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,23 +14,56 @@ export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const id = params.get("id");
 
-  if (!id) {
-    return Response.json({ error: "missing id" }, { status: 400 });
+  if (!isValidSessionId(id)) {
+    return Response.json({ error: "invalid id" }, { status: 400 });
+  }
+  if (!(await isAuthorizedSession(request, id))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
   }
 
   const now = Date.now();
   const staleCutoff = new Date(now - STALE_MS);
   const signalCutoff = new Date(now - SIGNAL_TTL_MS);
 
-  // 1) Heartbeat — refresh lastSeen for the caller.
-  await prisma.presence.updateMany({
-    where: {},
+  // 1) Heartbeat only the authenticated caller.
+  const heartbeat = await prisma.presence.updateMany({
+    where: { id },
     data: { lastSeen: new Date(now) },
   });
+  if (heartbeat.count === 0) {
+    return Response.json({ error: "session not found" }, { status: 404 });
+  }
 
-  // 2) Reap stale presence rows and orphaned signals (independent deletes —
-  // no atomicity needed, and avoids transactions over a PgBouncer pooler).
-  await prisma.presence.deleteMany({ where: { lastSeen: { lt: staleCutoff } } });
+  // 2) Remove stale sessions, their signals, and any now-orphaned connections.
+  await prisma.$executeRaw`
+    WITH stale AS (
+      DELETE FROM "Presence"
+      WHERE "lastSeen" < ${staleCutoff}
+      RETURNING id, "connectedTo"
+    ),
+    notified AS (
+      INSERT INTO "Signal" ("id", "fromId", "toId", "type", "payload")
+      SELECT gen_random_uuid()::text, stale.id, stale."connectedTo", 'end', NULL
+      FROM stale
+      WHERE stale."connectedTo" IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM "Presence" AS peer
+          WHERE peer.id = stale."connectedTo"
+            AND peer."lastSeen" >= ${staleCutoff}
+        )
+      RETURNING id
+    ),
+    orphaned AS (
+      DELETE FROM "Signal"
+      WHERE "toId" IN (SELECT id FROM stale)
+         OR "fromId" IN (SELECT id FROM stale)
+      RETURNING id
+    )
+    UPDATE "Presence" AS current
+    SET busy = false, "connectedTo" = NULL
+    WHERE current."connectedTo" IN (SELECT id FROM stale)
+  `;
   await prisma.signal.deleteMany({ where: { createdAt: { lt: signalCutoff } } });
 
   // 3) Online peers, excluding self.
@@ -49,7 +83,9 @@ export async function GET(request: NextRequest) {
   });
   if (inbox.length > 0) {
     await prisma.signal.deleteMany({
-      where: { id: { in: inbox.map((s) => s.id) } },
+      where: {
+        id: { in: inbox.filter((s) => s.type !== "request").map((s) => s.id) },
+      },
     });
   }
 

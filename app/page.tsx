@@ -9,7 +9,7 @@ import VideoPanel from "./components/VideoPanel";
 import { join, leave, poll, sendSignal } from "@/lib/api";
 import { PeerSession, type DescType, type PeerControl } from "@/lib/webrtc";
 import { POLL_INTERVAL_MS } from "@/lib/presence";
-import { type PeerDot, type SignalMsg } from "@/lib/types";
+import { type PeerDot, type SignalMsg, type SignalType } from "@/lib/types";
 
 type Conn =
   | { kind: "idle" }
@@ -25,7 +25,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 export default function Home() {
   const [phase, setPhase] = useState<"gate" | "live">("gate");
   const [sessionId] = useState(() => crypto.randomUUID());
+  const sessionToken = useRef("");
   const [peers, setPeers] = useState<PeerDot[]>([]);
+  const [blockedPeers, setBlockedPeers] = useState<Set<string>>(new Set());
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -51,10 +53,25 @@ export default function Home() {
   const peerRef = useRef<PeerSession | null>(null);
   const msgId = useRef(0);
   const requestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollErrorShown = useRef(false);
 
   function showNotice(text: string) {
     setNotice(text);
     window.setTimeout(() => setNotice(null), 3500);
+  }
+
+  async function relay(
+    peerId: string,
+    type: SignalType,
+    payload?: string,
+  ): Promise<boolean> {
+    try {
+      await sendSignal(sessionId, sessionToken.current, peerId, type, payload);
+      return true;
+    } catch {
+      showNotice("Signal interrupted. Please try again.");
+      return false;
+    }
   }
 
   function addMessage(mine: boolean, text: string) {
@@ -76,7 +93,7 @@ export default function Home() {
   function startPeer(peerId: string, initiator: boolean) {
     const ps = new PeerSession(initiator, {
       onSignal: (type: DescType, payload: string) => {
-        void sendSignal(sessionId, peerId, type, payload);
+        void relay(peerId, type, payload);
       },
       onChat: (text) => addMessage(false, text),
       onControl: (ctrl) => handleControl(ctrl),
@@ -131,13 +148,21 @@ export default function Home() {
   function requestConnection(peerId: string) {
     if (connRef.current.kind !== "idle") return;
     setConn({ kind: "requesting", peerId });
-    void sendSignal(sessionId, peerId, "request");
+    void relay(peerId, "request").then((sent) => {
+      if (
+        !sent &&
+        connRef.current.kind === "requesting" &&
+        connRef.current.peerId === peerId
+      ) {
+        teardown("Couldn't reach that person.");
+      }
+    });
     requestTimer.current = setTimeout(() => {
       if (
         connRef.current.kind === "requesting" &&
         connRef.current.peerId === peerId
       ) {
-        void sendSignal(sessionId, peerId, "end");
+        void relay(peerId, "end");
         teardown("No answer.");
       }
     }, REQUEST_TIMEOUT_MS);
@@ -145,7 +170,7 @@ export default function Home() {
 
   function cancelRequest() {
     if (connRef.current.kind === "requesting") {
-      void sendSignal(sessionId, connRef.current.peerId, "end");
+      void relay(connRef.current.peerId, "end");
     }
     teardown();
   }
@@ -154,22 +179,35 @@ export default function Home() {
     if (connRef.current.kind !== "incoming") return;
     const peerId = connRef.current.peerId;
     startPeer(peerId, false);
-    void sendSignal(sessionId, peerId, "accept");
+    void relay(peerId, "accept").then((sent) => {
+      if (!sent) teardown("Couldn't accept this request.");
+    });
     setConn({ kind: "connecting", peerId });
   }
 
-  function declineIncoming() {
+  async function declineIncoming() {
     if (connRef.current.kind !== "incoming") return;
-    void sendSignal(sessionId, connRef.current.peerId, "decline");
-    setConn({ kind: "idle" });
+    const peerId = connRef.current.peerId;
+    if (await relay(peerId, "decline")) {
+      setConn({ kind: "idle" });
+    }
   }
 
   function endConnection() {
     const c = connRef.current;
     if (c.kind === "connecting" || c.kind === "connected") {
-      void sendSignal(sessionId, c.peerId, "end");
+      void relay(c.peerId, "end");
     }
     teardown();
+  }
+
+  function blockCurrentPeer() {
+    const c = connRef.current;
+    if (c.kind !== "connecting" && c.kind !== "connected") return;
+    const blockedId = c.peerId;
+    setBlockedPeers((current) => new Set(current).add(blockedId));
+    void relay(blockedId, "end");
+    teardown("You left and blocked this person for the rest of this tab.");
   }
 
   function startVideoRequest() {
@@ -211,10 +249,18 @@ export default function Home() {
   function processSignal(sig: SignalMsg) {
     switch (sig.type) {
       case "request": {
-        if (connRef.current.kind === "idle") {
+        if (blockedPeers.has(sig.fromId)) {
+          void relay(sig.fromId, "decline");
+        } else if (
+          connRef.current.kind !== "idle" &&
+          connRef.current.kind !== "requesting" &&
+          connRef.current.peerId === sig.fromId
+        ) {
+          // The request remains in the mailbox until answered.
+        } else if (connRef.current.kind === "idle") {
           setConn({ kind: "incoming", peerId: sig.fromId });
         } else {
-          void sendSignal(sessionId, sig.fromId, "decline");
+          void relay(sig.fromId, "decline");
         }
         break;
       }
@@ -245,7 +291,9 @@ export default function Home() {
           void peerRef.current.handleSignal(
             sig.type as DescType,
             sig.payload ?? "",
-          );
+          ).catch(() => {
+            teardown("Couldn't establish a secure connection.");
+          });
         }
         break;
       }
@@ -277,11 +325,17 @@ export default function Home() {
 
     const tick = async () => {
       try {
-        const data = await poll(sessionId);
+        const data = await poll(sessionId, sessionToken.current);
         if (!active) return;
+        pollErrorShown.current = false;
         setPeers(data.peers);
         for (const s of data.signals) processSignalRef.current(s);
-      } catch {}
+      } catch {
+        if (!pollErrorShown.current) {
+          showNotice("Connection interrupted. Reconnecting…");
+          pollErrorShown.current = true;
+        }
+      }
       if (active) timer = setTimeout(tick, POLL_INTERVAL_MS);
     };
     tick();
@@ -294,7 +348,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!sessionId || phase !== "live") return;
-    const onLeave = () => leave(sessionId);
+    const onLeave = () => leave(sessionId, sessionToken.current);
     window.addEventListener("pagehide", onLeave);
     window.addEventListener("beforeunload", onLeave);
     return () => {
@@ -305,7 +359,7 @@ export default function Home() {
 
   async function handleReady(lat: number, lng: number) {
     setMyLocation({ lat, lng });
-    await join(sessionId, lat, lng);
+    sessionToken.current = await join(sessionId, lat, lng);
     setPhase("live");
   }
 
@@ -318,11 +372,25 @@ export default function Home() {
   return (
     <main className="fixed inset-0 overflow-hidden">
       <WorldMap
-        peers={peers}
+        peers={peers.filter((peer) => !blockedPeers.has(peer.id))}
         me={myLocation}
         onPeerClick={requestConnection}
         canConnect={conn.kind === "idle"}
       />
+
+      <header className="pointer-events-none absolute left-5 right-5 top-5 z-10 flex items-start justify-between sm:left-7 sm:right-7 sm:top-7">
+        <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/75 px-4 py-3 shadow-xl backdrop-blur-xl">
+          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-200/12 text-lg text-cyan-100">✳</span>
+          <div>
+            <p className="text-sm font-semibold tracking-tight text-white">Pulse</p>
+            <p className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-slate-400">The world, a little closer</p>
+          </div>
+        </div>
+        <div className="pointer-events-auto rounded-2xl border border-white/10 bg-slate-950/75 px-4 py-3 text-right shadow-xl backdrop-blur-xl">
+          <p className="text-sm font-medium text-slate-100">{peers.length + 1} on the map</p>
+          <p className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-cyan-100/70">Your location is fuzzed</p>
+        </div>
+      </header>
 
       {notice && (
         <div className="absolute left-1/2 top-20 z-30 -translate-x-1/2 rounded-full bg-zinc-800/90 px-4 py-2 text-sm text-zinc-100 shadow-lg backdrop-blur">
@@ -363,6 +431,7 @@ export default function Home() {
           }}
           onStartVideo={startVideoRequest}
           onEnd={endConnection}
+          onBlock={blockCurrentPeer}
         />
       )}
 
