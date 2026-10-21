@@ -2,9 +2,12 @@
 
 Welcome, and thanks for taking the time. **Pulse** is a working (mostly!) Next.js
 app: a living globe of anonymous strangers — every online user is a dot on a world
-map; tap one to connect for text chat or a video call. No accounts, no history,
-nothing stored. Coordination and WebRTC signaling run through the server
+map; tap one to connect for text chat or a video call. No accounts or chat
+history. Temporary presence and WebRTC signaling run through the server
 (Postgres + HTTP polling); chat and video are peer-to-peer over WebRTC.
+
+For the current architecture, data model (ERD), API, setup, privacy boundaries,
+and implementation history, see the [project guide](./docs/PROJECT_GUIDE.md).
 
 You'll work through **four phases**. They're designed to be realistic, not trick
 questions. We care as much about *how you think* as about what you ship — so a
